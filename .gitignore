@@ -21,3 +21,7 @@ output/*
 
 # Maintainer-specific words for the build audit. Never commit this.
 .forbidden_words
+
+# Release builds and downloaded archives. Never commit an archive of the
+# repo into the repo.
+*.zip

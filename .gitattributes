@@ -1,0 +1,14 @@
+# These files are executed by Windows. Batch files in particular misbehave
+# with LF endings, so pin them regardless of anyone's core.autocrlf setting.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.txt text eol=crlf
+
+# This one runs on the Linux pod. CRLF would break the shebang.
+*.sh  text eol=lf
+*.py  text eol=lf
+*.json text eol=lf
+
+# Markdown and licence text run everywhere; keep them LF.
+*.md text eol=lf
+LICENSE text eol=lf

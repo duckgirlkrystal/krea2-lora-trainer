@@ -1,0 +1,14 @@
+When training finishes, this folder will contain:
+
+  yourname_krea2_000001000.safetensors   <- your LoRA file
+  preview_images\                        <- pictures it made
+
+You may see several .safetensors files with different numbers.
+Those are snapshots taken at different points during training.
+
+The biggest number is NOT always the best one. A LoRA can be
+"overtrained", where it copies the photos too literally and stops
+being flexible. Start with the one around 1000 and compare.
+
+The training_log.txt file in here is just a record of what
+happened. You can ignore it unless something went wrong.

@@ -1,0 +1,23 @@
+# Everything a user generates by running this locally. None of it
+# belongs in the repo, and the photos are personal by definition.
+
+trainer/.venv/
+__pycache__/
+ai-toolkit/
+work/
+my_settings.json
+LAST_POD_ID.txt
+
+# Release builds. Attach the zip to a GitHub Release instead of committing it.
+dist/
+
+.DS_Store
+
+my_photos/*
+!my_photos/PUT YOUR PHOTOS IN THIS FOLDER.txt
+
+output/*
+!output/YOUR RESULTS WILL APPEAR HERE.txt
+
+# Maintainer-specific words for the build audit. Never commit this.
+.forbidden_words

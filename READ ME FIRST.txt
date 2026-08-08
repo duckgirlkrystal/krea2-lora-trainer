@@ -1,0 +1,147 @@
+====================================================================
+  KRYSTAL'S LORA TRAINER
+  Teach an image generator what one specific person looks like.
+====================================================================
+
+
+WHAT THIS DOES
+--------------
+
+You give it 20-50 photos of one person. It gives you back a small
+file called a "LoRA", plus some preview pictures so you can see it
+worked.
+
+That LoRA file is what you load into an image generator later to
+make new pictures of that person.
+
+The whole thing takes about 1 to 2 hours. You do not have to sit
+and watch it.
+
+
+====================================================================
+  STEP 1 - PUT YOUR PHOTOS IN THE "my_photos" FOLDER
+====================================================================
+
+Open the folder called "my_photos" and drop the pictures in.
+
+  - At least 15 photos. 25 to 40 works best.
+  - All of the SAME person.
+  - Mix them up. Close-up faces, waist-up shots, full body.
+    Different outfits, different lighting, different places.
+  - Sharp and in focus. Blurry photos make the result worse.
+  - Try to avoid other people being in the shot.
+  - iPhone photos (.HEIC) are fine. They get converted for you.
+
+More photos is not automatically better. 30 good photos beat
+100 mediocre ones.
+
+
+====================================================================
+  STEP 2 - PICK HOW YOU WANT TO TRAIN
+====================================================================
+
+There are two ways. Pick one.
+
+
+  OPTION A - RENT A CLOUD COMPUTER  (easiest, costs about $3)
+  -----------------------------------------------------------
+
+      Double-click:   1 - TRAIN IN THE CLOUD.bat
+
+  Works on ANY computer, even an old laptop with no graphics card.
+  It rents a powerful computer for an hour or two, trains your
+  character on it, downloads the result, and then shuts the rented
+  computer down so you stop paying.
+
+  You need a RunPod account with some money on it. The program
+  tells you exactly how to get one.
+
+
+  OPTION B - USE YOUR OWN GRAPHICS CARD  (free, but picky)
+  ---------------------------------------------------------
+
+      Double-click:   2 - TRAIN ON MY PC.bat
+
+  You need:
+    - An NVIDIA graphics card with 16GB of memory or more.
+      (RTX 3090, 4080, 4090, 5080, 5090, and similar.)
+    - 60GB of free disk space.
+    - Ideally 64GB of system RAM. 32GB can work but needs a
+      settings change the program will explain.
+
+  The program checks all of this for you first and tells you
+  plainly if your PC can't handle it. Nothing breaks if it can't.
+
+
+Either way, the program will ask you a few simple questions the
+first time you run it, and remember your answers after that.
+
+You do NOT need to edit any files. Just double-click and read.
+
+
+====================================================================
+  ABOUT MONEY (only matters for Option A, the cloud)
+====================================================================
+
+Renting the cloud computer costs roughly $1.40 per hour, and a
+normal run takes about 1.5 hours. So about $2 to $3 per character.
+
+Please do these two things before your first cloud run:
+
+  1. Put about $30 on your RunPod account. Not more.
+     RunPod is prepaid. If there is only $30 on the account, $30
+     is the absolute most you can ever be charged. This is the
+     single best protection against a surprise bill.
+
+  2. Turn OFF auto-pay in your RunPod account settings.
+     Auto-pay defeats the protection above.
+
+The program is built to shut the rented computer down when it is
+finished, and has several independent backstops in case something
+crashes. But nothing beats a spending cap.
+
+IF YOU ARE EVER WORRIED that something is still running and
+costing money:
+
+      Double-click:   3 - EMERGENCY - SHUT DOWN CLOUD.bat
+
+That shuts down every computer this program rented. If you happen
+to run other things on the same RunPod account, it lists those
+separately and asks first, so it will not kill your own work.
+It is always safe to run. Run it any time you feel unsure.
+
+You can also always go to https://console.runpod.io/pods in a
+browser and delete anything listed there by hand.
+
+
+====================================================================
+  WHERE YOUR RESULTS GO
+====================================================================
+
+Everything lands in the "output" folder.
+
+  - A file ending in .safetensors        <- this is your LoRA
+  - A "preview_images" folder            <- proof it worked
+
+You do NOT have to wait until the end to look. Each snapshot and
+preview picture is copied into that folder as soon as it is ready,
+roughly every few minutes, and the window tells you each time one
+arrives. Open them whenever you like while the rest carries on.
+
+If several .safetensors files show up, they are snapshots from
+different points in training. Later is not always better. Try the
+one around step 1000 first, then compare.
+
+
+====================================================================
+  IF SOMETHING GOES WRONG
+====================================================================
+
+The program tries to explain problems in plain English rather than
+showing you a wall of red text. If you hit something confusing,
+take a screenshot of the window and send it over.
+
+The window stays open when there is an error so you can read it.
+Do not worry about breaking anything. You cannot damage your
+computer by re-running this, and re-running after a crash will
+usually pick up where it left off.

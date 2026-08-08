@@ -1,0 +1,18 @@
+Drop 20 to 50 photos of ONE person into this folder.
+
+Good photos:
+  - Sharp and in focus
+  - A mix of close-up face, waist-up, and full body
+  - Different outfits, lighting, and backgrounds
+  - Just the one person in frame
+
+Avoid:
+  - Blurry or heavily filtered shots
+  - Sunglasses or anything covering the face in most of them
+  - Group photos
+  - Near-identical duplicates
+
+iPhone .HEIC photos are fine. JPG, PNG, and WEBP all work too.
+
+You can delete this text file once you have added your photos,
+or just leave it. It gets ignored either way.

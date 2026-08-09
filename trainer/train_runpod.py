@@ -83,6 +83,10 @@ REMOTE_WORK = "/workspace/krea2-training"
 REMOTE_DATASET = f"{REMOTE_WORK}/dataset"
 REMOTE_OUTPUT = f"{REMOTE_WORK}/output"
 REMOTE_CONFIG = f"{REMOTE_WORK}/config.yaml"
+# Cloud runs train with sampling off and render previews afterwards instead,
+# in a fresh process. The pod-side wrapper runs this config only once training
+# has exited 0, and swallows every failure: the LoRA is the deliverable.
+REMOTE_PREVIEW_CONFIG = f"{REMOTE_WORK}/preview_config.yaml"
 REMOTE_SCRIPT = f"{REMOTE_WORK}/setup_and_train.sh"
 REMOTE_CAPTIONER = f"{REMOTE_WORK}/caption_dataset.py"
 REMOTE_TERMINATOR = f"{REMOTE_WORK}/terminate_pod.py"
@@ -386,6 +390,10 @@ class Ssh:
         self.key = key
         self.username = username
         self.client = None
+        # Set when the pod reports it can shut itself down. Until then this
+        # client is the only thing standing between the user and an open-ended
+        # GPU bill, so the finally in run() must terminate unconditionally.
+        self.self_terminate_armed = False
 
     def connect(self, timeout_seconds: int = 240) -> None:
         import paramiko
@@ -479,6 +487,8 @@ class Ssh:
         stdin.close()
         for raw in iter(stdout.readline, ""):
             line = _strip_ansi(raw.rstrip("\r\n"))
+            if "SELF_TERMINATE_ARMED=1" in line:
+                self.self_terminate_armed = True
             if line.strip():
                 sh.say("    " + line)
         return stdout.channel.recv_exit_status()
@@ -570,7 +580,9 @@ def estimate_hours(group: dict, steps: int) -> float:
 # Upload / download
 # ---------------------------------------------------------------------------
 
-def upload_everything(ssh: Ssh, dataset_dir: Path, config_text: str) -> None:
+def upload_everything(
+    ssh: Ssh, dataset_dir: Path, config_text: str, preview_config_text: str = ""
+) -> None:
     ssh.run(f"mkdir -p {REMOTE_DATASET} {REMOTE_OUTPUT}")
 
     existing: dict[str, int] = {}
@@ -600,6 +612,10 @@ def upload_everything(ssh: Ssh, dataset_dir: Path, config_text: str) -> None:
 
         with sftp.open(REMOTE_CONFIG, "w") as handle:
             handle.write(config_text)
+
+        if preview_config_text:
+            with sftp.open(REMOTE_PREVIEW_CONFIG, "w") as handle:
+                handle.write(preview_config_text)
 
         for local_name, remote_path in (
             ("setup_and_train.sh", REMOTE_SCRIPT),
@@ -927,6 +943,34 @@ def read_recorded_pod_id() -> str:
     return lines[0].strip() if lines else ""
 
 
+def live_previous_pod(runpod: RunPod) -> str:
+    """Id of a still-running pod from an earlier run, or "" if there is none.
+
+    The client dying does not stop the pod: training carries on and the pod
+    waits for someone to come and collect. Without this, the next launch rents
+    a SECOND computer while the first is still billing and still holding the
+    only copy of the results.
+
+    Guarded by is_our_pod() rather than trusting the recorded id alone -
+    RunPod recycles ids, and a stale note once pointed the emergency shutdown
+    at a stranger's pod.
+    """
+    if not POD_KEY_FILE.exists():
+        return ""
+    pod_id = read_recorded_pod_id()
+    if not pod_id:
+        return ""
+    try:
+        pod = runpod.get_pod(pod_id)
+    except Exception:
+        return ""
+    if not pod or not is_our_pod(pod, pod_id):
+        return ""
+    if (pod.get("desiredStatus") or "").upper() in ("TERMINATED", "EXITED", "FAILED"):
+        return ""
+    return pod_id
+
+
 def find_running_pod(runpod: RunPod) -> str:
     """Ask RunPod which pod to reconnect to when the local note is missing."""
     try:
@@ -1003,12 +1047,13 @@ def shut_down(runpod: RunPod, pod_id: str, ssh: Ssh | None) -> None:
     if not pod_id:
         return
 
-    # Tell the pod-side wrapper we have what we need so it stops waiting.
+    # CLIENT_DONE is deliberately NOT written here. It means "I have the
+    # results, stop waiting and shut down", and this function runs on every
+    # exit path including the ones where nothing was downloaded at all. Written
+    # unconditionally it was a lie that collapsed the pod's own grace window -
+    # the last chance to salvage a run - at the exact moment it was needed.
+    # collect_results() writes it, once a download has actually succeeded.
     if ssh is not None:
-        try:
-            ssh.run(f"touch {REMOTE_CLIENT_DONE}", timeout=30)
-        except Exception:
-            pass
         ssh.close()
 
     sh.step("Shutting down the rented computer...")
@@ -1172,6 +1217,17 @@ def run(args: argparse.Namespace) -> int:
 
     runpod = RunPod(settings.runpod_api_key)
 
+    # Recovery has to be the thing that already happened, not a flag. The
+    # --resume path existed but no .bat ever passed it, so a user whose window
+    # closed mid-run had a working recovery route and no way to reach it.
+    # Same button, no arguments: if the earlier computer is still alive, go
+    # back to it rather than renting a second one alongside it.
+    if live_previous_pod(runpod):
+        sh.say()
+        sh.ok("An earlier run is still going on a rented computer.")
+        sh.step("Reconnecting to it instead of renting another one.")
+        return resume(args)
+
     sh.header("Step 2 of 5 - renting a computer")
     group, gpu_ids, price = choose_gpu_group(runpod, getattr(args, "gpu_group", ""))
     hours = estimate_hours(group, steps)
@@ -1192,12 +1248,32 @@ def run(args: argparse.Namespace) -> int:
         sh.ok("Cancelled. Nothing was created and you have not been charged.")
         return 0
 
+    # Sampling is switched OFF for every cloud run regardless of tier, and
+    # previews are rendered afterwards from the finished LoRA instead.
+    #
+    # Rationale (Aug 2026, from a real user's failed run): ai-toolkit calls
+    # self.sample() unguarded inside its training loop, so ANY error while
+    # writing a preview image aborts the whole job. An OSError [Errno 5] at
+    # PIL's fp.close() killed a 2000-step run at step 250. Cloud runs are
+    # unattended, billed by the hour, and keep the only copy of their results
+    # on a pod that deletes itself, so a nice-to-have image is not worth the
+    # risk of losing the run. Local runs keep their tier default: the user is
+    # sitting there, nothing is being billed, and a crash costs only time.
     config_text = _configs.build_training_config(
         run_name=run_name,
         trigger_word=settings.trigger_word,
         dataset_dir=REMOTE_DATASET,
         output_dir=REMOTE_OUTPUT,
         steps=steps,
+        tier=tier,
+        sample_during_training=False,
+    )
+    preview_config_text = _configs.build_preview_config(
+        run_name=run_name,
+        trigger_word=settings.trigger_word,
+        dataset_dir=REMOTE_DATASET,
+        output_dir=REMOTE_OUTPUT,
+        lora_path=f"{REMOTE_OUTPUT}/{run_name}/{run_name}.safetensors",
         tier=tier,
     )
 
@@ -1270,6 +1346,7 @@ def run(args: argparse.Namespace) -> int:
     sh.step(f"Automatic shutdown deadline: {terminate_after}")
 
     ssh: Ssh | None = None
+    finished = False
     try:
         sh.step("Waiting for it to start up...")
         host, port = wait_for_ssh_endpoint(runpod, pod_id)
@@ -1280,7 +1357,7 @@ def run(args: argparse.Namespace) -> int:
         sh.ok("Connected.")
 
         sh.header("Step 3 of 5 - sending your photos")
-        upload_everything(ssh, sh.DATASET_DIR, config_text)
+        upload_everything(ssh, sh.DATASET_DIR, config_text, preview_config_text)
 
         sh.header("Step 4 of 5 - training")
         sh.say("  Installing software and downloading the AI model.")
@@ -1307,6 +1384,11 @@ def run(args: argparse.Namespace) -> int:
 
         code = ssh.run_streaming(f"{env_prefix}bash {REMOTE_SCRIPT}", timeout=5400)
         if code != 0:
+            # Setup failed, so the pod is not in a state where its own shutdown
+            # can be trusted - the wrapper that runs the terminator may never
+            # have started even if the watchdog did arm. Take the killer role
+            # back rather than leave a broken pod billing until the 9h ceiling.
+            ssh.self_terminate_armed = False
             raise UserFacingError(
                 "Setting up the rented computer failed. The messages above\n"
                 "  explain why. Nothing further was started, and the computer\n"
@@ -1317,10 +1399,36 @@ def run(args: argparse.Namespace) -> int:
             sh.ok("Setup-only check passed. Nothing was trained.")
             return 0
 
-        return collect_results(ssh, steps, slug, settings.trigger_word)
+        outcome = collect_results(ssh, steps, slug, settings.trigger_word)
+        finished = True
+        return outcome
 
     finally:
-        shut_down(runpod, pod_id, ssh)
+        # Terminating here used to be unconditional. That made this client the
+        # sole custodian of a run whose only copy lives on a pod that deletes
+        # itself: a Ctrl+C, a crash, or a closed console at step 1500 destroyed
+        # every checkpoint. It stays unconditional in the one window where it
+        # has to be - before the pod reports it can shut itself down - because
+        # RunPod's own terminateAfter was measured NOT to fire, and a pod with
+        # no killer at all is an open-ended bill.
+        if finished or ssh is None or not ssh.self_terminate_armed:
+            shut_down(runpod, pod_id, ssh)
+        else:
+            sh.say()
+            sh.warn("Stopping before your results were saved to this PC.")
+            sh.say()
+            sh.say("  The rented computer is still working and will shut")
+            sh.say("  itself down on its own. Nothing is lost yet.")
+            sh.say()
+            sh.say("  To pick it up again, double-click:")
+            sh.say("      1 - TRAIN IN THE CLOUD.bat")
+            sh.say("  It will reconnect to the same computer automatically.")
+            sh.say()
+            sh.say("  If you would rather stop and not be charged any more,")
+            sh.say("  double-click \"3 - EMERGENCY - SHUT DOWN CLOUD.bat\".")
+            sh.say()
+            if ssh is not None:
+                ssh.close()
 
 
 def collect_results(ssh: Ssh, steps: int, slug: str, trigger_word: str) -> int:
@@ -1333,6 +1441,14 @@ def collect_results(ssh: Ssh, steps: int, slug: str, trigger_word: str) -> int:
 
     sh.header("Step 5 of 5 - collecting your results")
     saved = download_results(ssh, sh.OUTPUT_DIR)
+
+    # Only now is it true. Releases the pod from its grace wait so it shuts
+    # itself down within seconds instead of idling on the clock.
+    if saved:
+        try:
+            ssh.run(f"touch {REMOTE_CLIENT_DONE}", timeout=30)
+        except Exception:
+            pass
 
     if result == "dead":
         sh.warn("The LoRA came out empty, so it is not worth keeping.")
@@ -1405,14 +1521,38 @@ def resume(args: argparse.Namespace) -> int:
     sh.ok(f"Found your computer still running (id {pod_id}).")
 
     ssh: Ssh | None = None
+    finished = False
     try:
         host, port = wait_for_ssh_endpoint(runpod, pod_id)
         ssh = Ssh(host, port, key)
         ssh.connect(timeout_seconds=300)
         sh.ok("Reconnected. Picking up where it left off.")
-        return collect_results(ssh, steps, slug, settings.trigger_word)
+
+        # Whether this client may stand down as the pod's killer is a fact to
+        # check, not to assume: a pod whose setup died before the watchdog was
+        # armed is still RUNNING and still reachable, and standing down there
+        # would leave it billing with nothing able to stop it. Require both the
+        # terminator script and a live wrapper to run it.
+        _, _, term_code = ssh.run(
+            f"test -f {REMOTE_WORK}/terminate_pod.sh", timeout=30
+        )
+        _, _, wrap_code = ssh.run("pgrep -f run_training.sh > /dev/null", timeout=30)
+        ssh.self_terminate_armed = term_code == 0 and wrap_code == 0
+
+        outcome = collect_results(ssh, steps, slug, settings.trigger_word)
+        finished = True
+        return outcome
     finally:
-        shut_down(runpod, pod_id, ssh)
+        if finished or ssh is None or not ssh.self_terminate_armed:
+            shut_down(runpod, pod_id, ssh)
+        else:
+            sh.say()
+            sh.warn("Stopping before your results were saved to this PC.")
+            sh.say("  The rented computer is still working and will shut")
+            sh.say("  itself down on its own. Double-click")
+            sh.say("  \"1 - TRAIN IN THE CLOUD.bat\" to pick it up again.")
+            sh.say()
+            ssh.close()
 
 
 def wait_for_ssh_endpoint(runpod: RunPod, pod_id: str, timeout: int = 600) -> tuple[str, int]:

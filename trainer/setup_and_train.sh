@@ -45,6 +45,9 @@ REPO_DIR="$WORK_DIR/ai-toolkit"
 DATASET_DIR="$WORK_DIR/dataset"
 OUTPUT_DIR="$WORK_DIR/output"
 CONFIG_FILE="$WORK_DIR/config.yaml"
+# Optional. Uploaded by the cloud client, which trains with sampling disabled
+# and renders previews afterwards from the finished LoRA instead.
+PREVIEW_CONFIG="$WORK_DIR/preview_config.yaml"
 TRAIN_LOG="$WORK_DIR/training.log"
 CAPTION_LOG="$WORK_DIR/captioning.log"
 CAPTION_SCRIPT="$WORK_DIR/caption_dataset.py"
@@ -392,9 +395,17 @@ chmod +x "$TERMINATOR"
 # Contains the account API key.
 chmod 600 "$TERMINATOR" 2>/dev/null || true
 
-if [ ! -f "$TERMINATOR_PY" ]; then
-    print_warning "terminate_pod.py was not uploaded; this pod cannot shut"
-    print_warning "itself down. The client will still terminate it."
+# Load-bearing, and deliberately fatal. This used to be a warning that said
+# "the client will still terminate it" - true only while the client's finally
+# terminated unconditionally. Now that the client stands down once this pod
+# reports itself armed (SELF_TERMINATE_ARMED below), a missing terminator
+# would mean NOTHING can shut the pod down. Refusing to train is the safe
+# failure: the user loses a few minutes, not an open-ended GPU bill.
+if [ ! -f "$TERMINATOR_PY" ] && [ "$SELF_TERMINATE" = "1" ]; then
+    print_error "The program that shuts this computer down is missing, so"
+    print_error "training will not start. You have not been charged for any"
+    print_error "training. Please try again."
+    exit 1
 fi
 
 cat > "$WRAPPER" <<WRAPPER_EOF
@@ -406,6 +417,7 @@ set -uo pipefail
 WORK_DIR="$WORK_DIR"
 REPO_DIR="$REPO_DIR"
 CONFIG_FILE="$CONFIG_FILE"
+PREVIEW_CONFIG="$PREVIEW_CONFIG"
 
 cd "\$REPO_DIR" || exit 1
 
@@ -416,12 +428,36 @@ timeout --signal=TERM --kill-after=120 $MAX_TRAIN_SECONDS \\
     .venv/bin/python run.py "\$CONFIG_FILE"
 RC=\$?
 
+# Previews run BEFORE the client is told training finished. monitor() breaks
+# out of its loop the moment it sees TRAINING_EXIT_CODE= in the log, so
+# anything written after that line risks not being collected.
+#
+# Every failure here is swallowed on purpose. The LoRA is the deliverable and
+# it is already on disk; a preview image is a nicety and must never be able to
+# affect the exit code. This is the same trade train_local.py makes in
+# generate_previews().
+if [ \$RC -eq 0 ] && [ -f "\$PREVIEW_CONFIG" ]; then
+    echo "Making preview pictures from the finished LoRA (about 10 minutes)."
+    echo "Your LoRA is already saved and safe."
+    timeout --signal=TERM --kill-after=60 3600 \\
+        env HF_TOKEN="$HF_TOKEN" HF_HOME="$HF_HOME" DISABLE_TELEMETRY=YES \\
+            HF_HUB_ENABLE_HF_TRANSFER=0 \\
+        .venv/bin/python run.py "\$PREVIEW_CONFIG" \\
+        || echo "PREVIEW_FAILED - no preview pictures, but the LoRA is fine."
+fi
+
 echo ""
 echo "TRAINING_EXIT_CODE=\$RC"
 if [ \$RC -eq 124 ] || [ \$RC -eq 137 ]; then
     echo "TRAINING_TIMED_OUT after $MAX_TRAIN_HOURS hours"
 fi
 touch "\$WORK_DIR/TRAINING_DONE"
+# A marker named DONE written on a crash reads as success to anything that
+# only tests for it. Record the failure separately so the client, and anyone
+# reading the pod by hand, can tell the two apart.
+if [ \$RC -ne 0 ]; then
+    touch "\$WORK_DIR/TRAINING_FAILED"
+fi
 echo "TRAINING_DONE_MARKER_WRITTEN"
 
 if [ "$SELF_TERMINATE" != "1" ]; then
@@ -431,9 +467,20 @@ fi
 
 # Give the client time to download results. It writes CLIENT_DONE the moment
 # it has everything, so the normal path shuts down within seconds.
-echo "Waiting up to $GRACE_HOURS hour(s) for results to be collected..."
+# A failed run gets a longer window than a successful one. On success the
+# client collects within seconds and writes CLIENT_DONE. On failure there may
+# be a salvageable checkpoint on a disk that is about to be destroyed, and the
+# user has to notice, read the message, and start the client again - which the
+# default two hours does not reliably allow for. The watchdog ceiling
+# (MAX_TRAIN + GRACE + 1h) is unchanged and still hard-kills the pod, so this
+# cannot extend the worst-case bill beyond what was already budgeted.
+GRACE_LEFT=$GRACE_SECONDS
+if [ \$RC -ne 0 ]; then
+    GRACE_LEFT=\$(( $GRACE_SECONDS * 3 ))
+fi
+echo "Waiting up to \$(( GRACE_LEFT / 3600 )) hour(s) for results to be collected..."
 WAITED=0
-while [ \$WAITED -lt $GRACE_SECONDS ]; do
+while [ \$WAITED -lt \$GRACE_LEFT ]; do
     if [ -f "\$WORK_DIR/CLIENT_DONE" ]; then
         echo "Client collected the results."
         break
@@ -473,6 +520,11 @@ WATCHDOG_PID=$!
 sleep 2
 if kill -0 "$WATCHDOG_PID" 2>/dev/null; then
     print_success "Watchdog armed (PID $WATCHDOG_PID)"
+    # Handshake for the client's finally. Printed only once the terminator
+    # exists AND the watchdog is confirmed alive - i.e. only once this pod can
+    # provably shut itself down. Until the client sees this line it stays the
+    # killer of last resort. Do not move it earlier.
+    echo "SELF_TERMINATE_ARMED=1"
 else
     print_error "The safety timer that shuts this computer down could not"
     print_error "be started, so training will not begin. You have not been"

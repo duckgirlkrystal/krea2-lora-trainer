@@ -172,8 +172,13 @@ def build_training_config(
     steps: int,
     tier: Tier,
     save_every: int = 250,
+    sample_during_training: bool | None = None,
 ) -> str:
-    """Generate the ai-toolkit training config for one character."""
+    """Generate the ai-toolkit training config for one character.
+
+    `sample_during_training` overrides the tier default. Cloud runs pass
+    False: see the comment at the call site in train_runpod.py.
+    """
     caching = tier.cache_text_embeddings
     # Caption dropout needs a cached blank embedding; skip it when the text
     # encoder has already been discarded rather than risk a mid-run crash.
@@ -181,6 +186,19 @@ def build_training_config(
     prompts = "\n".join(f"          - {_q(p)}" for p in sample_prompts(trigger_word))
     max_keep = max(4, (steps // save_every) + 1)
     sample_res = max(tier.resolutions)
+    sampling = (
+        tier.sample_during_training
+        if sample_during_training is None
+        else sample_during_training
+    )
+    # Deliberately NOT equal to save_every. ai-toolkit saves the checkpoint and
+    # then samples within the same step when the two line up, so a single failed
+    # preview write kills the run at the exact step its first checkpoint appears.
+    # Observed live (Aug 2026): OSError [Errno 5] at PIL's fp.close() writing a
+    # preview into samples/.tmp/ took down a 2000-step run at step 250, before
+    # anything had ever been collected. save_every + 1 is coprime with
+    # save_every, so the two never coincide over any realistic run length.
+    sample_every = save_every + 1
 
     return f"""---
 # Krea 2 character LoRA - generated automatically, do not hand-edit.
@@ -225,13 +243,13 @@ config:
         lr: 1e-4
         dtype: bf16
         cache_text_embeddings: {str(caching).lower()}
-        disable_sampling: {str(not tier.sample_during_training).lower()}
+        disable_sampling: {str(not sampling).lower()}
         skip_first_sample: true
       model:
 {_model_block(tier)}
       sample:
         sampler: "flowmatch"
-        sample_every: {save_every}
+        sample_every: {sample_every}
         width: {sample_res}
         height: {sample_res}
         prompts:

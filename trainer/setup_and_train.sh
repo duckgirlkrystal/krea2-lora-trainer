@@ -158,12 +158,15 @@ else
     # Unpinned on purpose: RunPod images set PIP_CONSTRAINT pinning the torch
     # stack, so an explicit version pin that differs is guaranteed to fail
     # resolution.
+    # pip runs unquieted so a stalled download names the file it stalled on.
+    # The progress bar stays off: it redraws with \r, and the client only
+    # prints complete lines, so it would arrive as one garbled line at the end.
     print_status "Installing PyTorch (this takes a few minutes)..."
-    .venv/bin/pip install --upgrade pip -q
+    .venv/bin/pip install --upgrade pip --progress-bar off
     if ! .venv/bin/pip install --no-cache-dir torch torchvision torchaudio \
-            --index-url https://download.pytorch.org/whl/cu128 -q; then
+            --index-url https://download.pytorch.org/whl/cu128 --progress-bar off; then
         print_warning "cu128 index failed, falling back to default wheels"
-        .venv/bin/pip install --no-cache-dir torch torchvision torchaudio -q
+        .venv/bin/pip install --no-cache-dir torch torchvision torchaudio --progress-bar off
     fi
     print_success "PyTorch installed"
 fi
@@ -173,7 +176,7 @@ if .venv/bin/python3 -c "import diffusers, transformers, optimum.quanto" 2>/dev/
     print_success "Dependencies already installed"
 else
     print_status "Installing dependencies (10-20 minutes on a fresh pod)..."
-    if ! .venv/bin/pip install -r requirements.txt -q; then
+    if ! .venv/bin/pip install -r requirements.txt --progress-bar off; then
         print_error "Dependency install failed."
         exit 1
     fi
@@ -185,8 +188,8 @@ fi
 if ! .venv/bin/python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
     print_status "Re-forcing CUDA PyTorch (dependencies overwrote it)..."
     .venv/bin/pip install --no-cache-dir torch torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/cu128 --force-reinstall -q \
-        || .venv/bin/pip install --no-cache-dir torch torchvision torchaudio --force-reinstall -q
+        --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --progress-bar off \
+        || .venv/bin/pip install --no-cache-dir torch torchvision torchaudio --force-reinstall --progress-bar off
 fi
 
 # =============================================================================

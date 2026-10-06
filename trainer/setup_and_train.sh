@@ -159,8 +159,8 @@ else
     # stack, so an explicit version pin that differs is guaranteed to fail
     # resolution.
     # pip runs unquieted so a stalled download names the file it stalled on.
-    # The progress bar stays off: it redraws with \r, and the client only
-    # prints complete lines, so it would arrive as one garbled line at the end.
+    # The progress bar stays off: it redraws with \r, and the client keeps
+    # only a line's final state, so the bar would show nothing but "100%".
     print_status "Installing PyTorch (this takes a few minutes)..."
     .venv/bin/pip install --upgrade pip --progress-bar off
     if ! .venv/bin/pip install --no-cache-dir torch torchvision torchaudio \

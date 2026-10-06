@@ -218,7 +218,11 @@ class RunPod:
         """Return {gpu_id: {price, availability}} or {} if unavailable."""
         data = self.rest(
             "GET", "/catalog/gpus",
-            params={"include": "AVAILABILITY", "cloud": "SECURE", "count": 1},
+            # `product` became mandatory alongside include=AVAILABILITY (Oct
+            # 2026); without it the endpoint 400s and every run falls back
+            # to the hardcoded prices.
+            params={"include": "AVAILABILITY", "cloud": "SECURE", "count": 1,
+                    "product": "POD"},
         )
         if not data:
             return {}
@@ -486,7 +490,10 @@ class Ssh:
         )
         stdin.close()
         for raw in iter(stdout.readline, ""):
-            line = _strip_ansi(raw.rstrip("\r\n"))
+            # Progress meters (git clone, pip) redraw in place with bare \r.
+            # The console only gets whole lines, so every redraw would land
+            # glued into one enormous line; keep just the final state.
+            line = _strip_ansi(raw.rstrip("\r\n").split("\r")[-1])
             if "SELF_TERMINATE_ARMED=1" in line:
                 self.self_terminate_armed = True
             if line.strip():
@@ -507,11 +514,15 @@ class Ssh:
         self.client = None
 
 
-_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# `?` covers private-mode codes such as pip's cursor show/hide (\x1b[?25h),
+# which otherwise reach the console as literal "[?25h".
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+# pip's build spinner draws each frame as "<char>\b"; drop the pair.
+_BACKSPACED = re.compile(r".\x08")
 
 
 def _strip_ansi(text: str) -> str:
-    return _ANSI.sub("", text)
+    return _BACKSPACED.sub("", _ANSI.sub("", text))
 
 
 def _shell_quote(text: str) -> str:
@@ -788,8 +799,11 @@ def monitor(ssh: Ssh, steps: int, output_dir: Path) -> str:
     sh.say()
     sh.say("  Training is running on the rented computer.")
     sh.say("  You can leave this window open and go and do something else.")
-    sh.say("  Closing it will NOT stop the training, but it will stop the")
-    sh.say("  automatic shutdown, so please leave it running if you can.")
+    sh.say("  Please leave it open. If you close it, the training carries on")
+    sh.say("  and the rented computer still shuts itself down, but only after")
+    sh.say("  waiting up to 2 hours for your results to be collected - and you")
+    sh.say("  are charged for that wait. To collect them, run")
+    sh.say("  \"1 - TRAIN IN THE CLOUD.bat\" again before then.")
     sh.say()
     sh.say("  Snapshots and preview pictures are copied into the 'output'")
     sh.say("  folder as soon as each one is ready, so you can look at them")

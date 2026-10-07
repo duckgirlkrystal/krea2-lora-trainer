@@ -624,6 +624,7 @@ def main() -> int:
     parser.add_argument("--no-preview", action="store_true",
                         help="Skip generating preview images afterwards")
     args = parser.parse_args()
+    sh.disable_click_to_pause()
 
     try:
         return run(args)

@@ -273,6 +273,7 @@ def build_preview_config(
     output_dir: str,
     lora_path: str,
     tier: Tier,
+    sample_once: bool = False,
 ) -> str:
     """Generate a config that loads a finished LoRA and samples from it.
 
@@ -284,9 +285,20 @@ def build_preview_config(
     This trains for a single throwaway step but takes its sample first
     (force_first_sample with skip_first_sample off), so the images reflect
     the LoRA exactly as trained.
+
+    ai-toolkit also samples once more at the end of every job unless sampling
+    is disabled outright, which would disable the first sample too
+    (BaseSDTrainProcess, end of train loop). So by default every prompt is
+    rendered twice. sample_once skips the first round and keeps only the end
+    one, taken after the one step at lr 1e-8 - the same LoRA in practice.
+    Cloud runs use it: the end round rendered fine on an 80GB card (Oct
+    2026), and skipping the first halves the preview time. Local runs keep the default because the end sample runs with that
+    step's optimizer state still allocated, which is untested on small cards.
     """
     prompts = "\n".join(f"          - {_q(p)}" for p in sample_prompts(trigger_word))
     sample_res = min(1024, max(tier.resolutions))
+    skip_first = "true" if sample_once else "false"
+    force_first = "false" if sample_once else "true"
 
     return f"""---
 # Preview-only pass. Loads the finished LoRA and renders sample images.
@@ -328,8 +340,8 @@ config:
         dtype: bf16
         cache_text_embeddings: false
         disable_sampling: false
-        skip_first_sample: false
-        force_first_sample: true
+        skip_first_sample: {skip_first}
+        force_first_sample: {force_first}
       model:
 {_model_block(tier)}
       sample:

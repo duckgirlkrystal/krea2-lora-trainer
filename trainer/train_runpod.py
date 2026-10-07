@@ -93,6 +93,22 @@ REMOTE_TERMINATOR = f"{REMOTE_WORK}/terminate_pod.py"
 REMOTE_LOG = f"{REMOTE_WORK}/training.log"
 REMOTE_DONE = f"{REMOTE_WORK}/TRAINING_DONE"
 REMOTE_CLIENT_DONE = f"{REMOTE_WORK}/CLIENT_DONE"
+# Setup runs detached on the pod (see run_setup); these are how the client
+# follows it. SETUP_PID holds the pid of the shell running the script, so a
+# stall check can tell "still running" from "died without saying why".
+REMOTE_SETUP_LOG = f"{REMOTE_WORK}/setup.log"
+REMOTE_SETUP_EXIT = f"{REMOTE_WORK}/SETUP_EXIT"
+REMOTE_SETUP_PID = f"{REMOTE_WORK}/SETUP_PID"
+
+# The whole of setup normally takes 15-25 minutes.
+SETUP_TIMEOUT_SECONDS = 90 * 60
+# How long setup may print nothing before the client looks at the pod...
+SETUP_QUIET_CHECK_SECONDS = 5 * 60
+# ...and before it gives up on that pod altogether. The longest legitimate
+# silence is one large wheel download on a slow link, well under this.
+SETUP_QUIET_LIMIT_SECONDS = 30 * 60
+# Saved for every run so the user can send a file instead of a screenshot.
+SETUP_LOG_FILE = sh.OUTPUT_DIR / "setup_log.txt"
 
 # The private half of the throwaway pod key. Persisted so an interrupted run
 # can be resumed rather than abandoned with the pod still billing.
@@ -104,13 +120,30 @@ POD_KEY_FILE = sh.WORK_DIR / "pod_key"
 # sixteen files for eight pictures.
 NO_HIDDEN_DIRS = r"-not -path '*/.*/*'"
 
+# The preview pass (build_preview_config) runs as its own ai-toolkit job in
+# output/<run>_preview/, and ai-toolkit saves the model at the end of every
+# job regardless of save_every (BaseSDTrainProcess, end of train loop). That
+# file is a throwaway copy, one step at lr 1e-8 away from the real LoRA. Seen
+# Oct 2026: it was downloaded beside the real one and the summary told the
+# user to compare the two. Its preview images are still collected.
+NOT_PREVIEW_LORA = r"-not -path '*_preview/*.safetensors'"
+
 # Every pod this trainer starts is named with this prefix, which is how the
 # emergency shutdown tells its own pods from anything else on the account.
 POD_NAME_PREFIX = "krea2-"
 
 POD_IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
-CONTAINER_DISK_GB = 50
-VOLUME_GB = 100
+# Everything lives on the container disk; the pod gets no network volume.
+# Measured Oct 2026: on RunPod the volume at /workspace can be MooseFS over
+# FUSE. Large files are fine there (64 MB in 0.5 s) but small ones are ~80x
+# slower than the container disk (200 files: 10.8 s vs 0.14 s), and setup
+# writes tens of thousands of them - PyTorch's install alone ran 20+ minutes
+# at 0% CPU instead of 2. Without a volume, /workspace is a plain directory
+# on the container disk, so every path below still works.
+#
+# Sized for the peak: the ~35 GB model plus HuggingFace's transient copy
+# while it verifies, ~12 GB of Python environment, checkpoints and slack.
+CONTAINER_DISK_GB = 150
 
 # Two groups of candidates. Every card within a group runs the same training
 # config, so whichever one RunPod's scheduler hands us, the config is valid.
@@ -218,7 +251,11 @@ class RunPod:
         """Return {gpu_id: {price, availability}} or {} if unavailable."""
         data = self.rest(
             "GET", "/catalog/gpus",
-            params={"include": "AVAILABILITY", "cloud": "SECURE", "count": 1},
+            # `product` became mandatory alongside include=AVAILABILITY (Oct
+            # 2026); without it the endpoint 400s and every run falls back
+            # to the hardcoded prices.
+            params={"include": "AVAILABILITY", "cloud": "SECURE", "count": 1,
+                    "product": "POD"},
         )
         if not data:
             return {}
@@ -267,8 +304,7 @@ class RunPod:
             "gpuTypeIdList": gpu_ids,
             "gpuCount": 1,
             "containerDiskInGb": CONTAINER_DISK_GB,
-            "volumeInGb": VOLUME_GB,
-            "volumeMountPath": "/workspace",
+            "volumeInGb": 0,
             "minVcpuCount": 8,
             "minMemoryInGb": 32,
             "ports": "22/tcp",
@@ -477,22 +513,6 @@ class Ssh:
         )
         self.run(wrapped, timeout=60)
 
-    def run_streaming(self, command: str, timeout: int = 7200) -> int:
-        """Run a command, printing pod output as it arrives."""
-        self.ensure()
-        assert self.client is not None
-        stdin, stdout, stderr = self.client.exec_command(
-            command, timeout=timeout, get_pty=True
-        )
-        stdin.close()
-        for raw in iter(stdout.readline, ""):
-            line = _strip_ansi(raw.rstrip("\r\n"))
-            if "SELF_TERMINATE_ARMED=1" in line:
-                self.self_terminate_armed = True
-            if line.strip():
-                sh.say("    " + line)
-        return stdout.channel.recv_exit_status()
-
     def sftp(self):
         self.ensure()
         assert self.client is not None
@@ -507,15 +527,355 @@ class Ssh:
         self.client = None
 
 
-_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# `?` covers private-mode codes such as pip's cursor show/hide (\x1b[?25h),
+# which otherwise reach the console as literal "[?25h".
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+# pip's build spinner draws each frame as "<char>\b"; drop the pair.
+_BACKSPACED = re.compile(r".\x08")
 
 
 def _strip_ansi(text: str) -> str:
-    return _ANSI.sub("", text)
+    return _BACKSPACED.sub("", _ANSI.sub("", text))
 
 
 def _shell_quote(text: str) -> str:
     return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+# ---------------------------------------------------------------------------
+# Pod setup
+# ---------------------------------------------------------------------------
+
+# Lines from the setup script's print_status/print_success/... helpers and
+# its phase headers. These get a clock time in the window; pip's own chatter
+# does not, or every line would carry one.
+_SETUP_STEP_LINE = re.compile(r"^(\[(INFO|OK|WARN|ERROR)\]|===)")
+_SETUP_READ_LIMIT = 1_000_000
+
+# Runs on the pod when setup has gone quiet. Prints KEY=value lines. It reads
+# SETUP_PID rather than using pgrep -f on the script name: this probe's own
+# command line contains that name, so pgrep would always find the probe.
+_STALL_PROBE = f"""
+pid=$(cat {REMOTE_SETUP_PID} 2>/dev/null)
+if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo SETUP_ALIVE=yes; else echo SETUP_ALIVE=no; fi
+cpu() {{ awk '/^cpu /{{print $2+$3+$4+$7+$8+$9, $6, $2+$3+$4+$5+$6+$7+$8+$9}}' /proc/stat; }}
+net() {{ awk -F'[: ]+' 'NR>2 && $2!="lo" {{s+=$3}} END {{print s+0}}' /proc/net/dev; }}
+set -- $(cpu); b1=$1; w1=$2; t1=$3; r1=$(net)
+sleep 5
+set -- $(cpu); b2=$1; w2=$2; t2=$3; r2=$(net)
+dt=$(( t2 - t1 )); [ "$dt" -gt 0 ] || dt=1
+echo CPU_BUSY_PCT=$(( 100 * (b2 - b1) / dt ))
+echo IOWAIT_PCT=$(( 100 * (w2 - w1) / dt ))
+echo NET_KBPS=$(( (r2 - r1) / 5120 ))
+s=$(date +%s%N)
+timeout -k 5 60 dd if=/dev/zero of={REMOTE_WORK}/.disk_probe bs=1M count=64 conv=fsync 2>/dev/null
+echo DISK_RC=$?
+echo DISK_MS=$(( ($(date +%s%N) - s) / 1000000 ))
+rm -f {REMOTE_WORK}/.disk_probe
+s=$(date +%s%N)
+timeout -k 5 60 bash -c 'mkdir -p {REMOTE_WORK}/.small_probe && for i in $(seq 100); do echo x > {REMOTE_WORK}/.small_probe/$i; done'
+echo SMALL_RC=$?
+echo SMALL_MS=$(( ($(date +%s%N) - s) / 1000000 ))
+rm -rf {REMOTE_WORK}/.small_probe
+echo FS_TYPE=$(findmnt -no FSTYPE --target {REMOTE_WORK} 2>/dev/null)
+ps -eo stat=,etime=,wchan:22=,args= \\
+    | awk '$4 ~ /pip|python|git|apt|dpkg|curl|wget|tar/ && $0 !~ /ps -eo|awk/' \\
+    | cut -c1-160 | head -5 | sed 's/^/PROC=/'
+"""
+
+
+class SetupLog:
+    """A timestamped local copy of the pod's setup output.
+
+    Exists so a stuck run can be diagnosed from a file the user sends, not
+    from a screenshot of whatever happened to still be on screen.
+    """
+
+    def __init__(self, path: Path, pod_id: str) -> None:
+        self.handle = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.handle = open(path, "w", encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        self.write(f"Setup log for pod {pod_id}, started "
+                   f"{datetime.now():%Y-%m-%d %H:%M:%S} (this PC's clock)")
+
+    def write(self, text: str) -> None:
+        if self.handle is None:
+            return
+        try:
+            self.handle.write(f"{datetime.now():%H:%M:%S}  {text}\n")
+            self.handle.flush()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        if self.handle is not None:
+            try:
+                self.handle.close()
+            except OSError:
+                pass
+
+
+def run_setup(ssh: Ssh, env_prefix: str, pod_id: str) -> int:
+    """Run setup_and_train.sh on the pod in the background and follow it.
+
+    Returns the script's exit code. Raises UserFacingError if the pod stalls.
+
+    Setup used to be a live SSH command writing straight into the user's
+    console. Seen live (Oct 2026): a pod sat at 0% CPU for hours on pip's
+    "Installing collected packages" with every download finished. A Windows
+    console paused by a click stops reading, the SSH window fills, and the
+    pod's pip blocks writing its next line - so the window could freeze the
+    install. Detached, the pod never waits on this window; the client reads
+    the log file whenever it gets the chance.
+    """
+    log = SetupLog(SETUP_LOG_FILE, pod_id)
+    try:
+        return _follow_setup(ssh, env_prefix, log)
+    finally:
+        log.close()
+
+
+def _follow_setup(ssh: Ssh, env_prefix: str, log: SetupLog) -> int:
+    ssh.run(
+        f"rm -f {REMOTE_SETUP_LOG} {REMOTE_SETUP_EXIT} {REMOTE_SETUP_PID}",
+        timeout=60,
+    )
+    # No pty now, so Python's output would be block-buffered into the log
+    # file and arrive in lumps; PYTHONUNBUFFERED keeps it line by line.
+    ssh.run_detached(
+        f"echo $$ > {REMOTE_SETUP_PID}; "
+        f"{env_prefix}PYTHONUNBUFFERED=1 bash {REMOTE_SCRIPT}; "
+        f"echo $? > {REMOTE_SETUP_EXIT}",
+        REMOTE_SETUP_LOG,
+    )
+
+    offset = 0
+    pending = b""
+    started = last_output = time.time()
+    next_check = SETUP_QUIET_CHECK_SECONDS
+    stuck_checks = 0
+    consecutive_errors = 0
+
+    while True:
+        time.sleep(5)
+        try:
+            chunk, exit_code = _read_setup(ssh, offset)
+            consecutive_errors = 0
+        except UserFacingError:
+            raise
+        except Exception as exc:
+            consecutive_errors += 1
+            if consecutive_errors == 1:
+                sh.step("Connection hiccup, reconnecting...")
+            if consecutive_errors > 30:
+                log.write(f"client: lost contact with the pod ({exc})")
+                ssh.self_terminate_armed = False
+                raise UserFacingError(
+                    f"Lost contact with the rented computer ({exc}).\n\n"
+                    "  It is being shut down so you stop being charged.\n\n"
+                    f"  A full log was saved to:\n    {SETUP_LOG_FILE}"
+                )
+            try:
+                ssh.close()
+                ssh.connect(timeout_seconds=120)
+            except Exception:
+                pass
+            continue
+
+        now = time.time()
+        if chunk:
+            offset += len(chunk)
+            last_output = now
+            next_check = SETUP_QUIET_CHECK_SECONDS
+            stuck_checks = 0
+            pending += chunk
+            *complete, pending = pending.split(b"\n")
+            for raw in complete:
+                _show_setup_line(ssh, raw, log)
+
+        if exit_code is not None:
+            if pending.strip():
+                _show_setup_line(ssh, pending, log)
+            log.write(f"client: setup exited with code {exit_code}")
+            return exit_code
+
+        if now - started > SETUP_TIMEOUT_SECONDS:
+            _give_up(ssh, log, "Setup ran for over "
+                     f"{SETUP_TIMEOUT_SECONDS // 60} minutes. It normally takes 15-25.")
+
+        quiet = now - last_output
+        if quiet >= next_check:
+            next_check += SETUP_QUIET_CHECK_SECONDS
+            verdict, explanation = _check_quiet_pod(ssh, quiet, log)
+            stuck_checks = stuck_checks + 1 if verdict == "stuck" else 0
+            # "broken" cannot recover. "stuck" gets one more look first, so a
+            # pause that happens to straddle a check is not fatal. Anything
+            # else is given until the quiet limit.
+            if (verdict == "broken" or stuck_checks >= 2
+                    or quiet >= SETUP_QUIET_LIMIT_SECONDS):
+                _give_up(ssh, log, explanation)
+
+
+def _read_setup(ssh: Ssh, offset: int) -> tuple[bytes, int | None]:
+    """Return (new log bytes from offset, exit code or None if still running).
+
+    The exit file is read BEFORE the log. The other order loses the script's
+    last lines whenever it finishes between the two reads.
+    """
+    sftp = ssh.sftp()
+    try:
+        exit_code = None
+        try:
+            with sftp.open(REMOTE_SETUP_EXIT, "r") as handle:
+                text = handle.read().decode("utf-8", errors="replace").strip()
+            if text.isdigit():
+                exit_code = int(text)
+        except FileNotFoundError:
+            pass
+        chunk = b""
+        try:
+            with sftp.open(REMOTE_SETUP_LOG, "rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read(_SETUP_READ_LIMIT)
+        except FileNotFoundError:
+            pass
+    finally:
+        sftp.close()
+    # A full read may have left more behind; report the exit next time round.
+    if len(chunk) >= _SETUP_READ_LIMIT:
+        exit_code = None
+    return chunk, exit_code
+
+
+def _show_setup_line(ssh: Ssh, raw: bytes, log: SetupLog) -> None:
+    # Progress meters (git clone, pip) redraw in place with bare \r. The
+    # console only gets whole lines, so every redraw would land glued into
+    # one enormous line; keep just the final state.
+    text = raw.decode("utf-8", errors="replace").rstrip("\r").split("\r")[-1]
+    line = _strip_ansi(text)
+    if "SELF_TERMINATE_ARMED=1" in line:
+        ssh.self_terminate_armed = True
+    if not line.strip():
+        return
+    log.write(line)
+    if _SETUP_STEP_LINE.match(line.strip()):
+        sh.say(f"    {datetime.now():%H:%M}  {line}")
+    else:
+        sh.say("           " + line)
+
+
+def _probe_pod(ssh: Ssh) -> dict[str, Any]:
+    out, _, _ = ssh.run(_STALL_PROBE, timeout=150)
+    facts: dict[str, Any] = {"answered": bool(out.strip()), "procs": []}
+    for line in out.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        if key == "PROC":
+            facts["procs"].append(value.strip())
+        else:
+            facts[key] = value.strip()
+    return facts
+
+
+def _fact(facts: dict[str, Any], key: str) -> int:
+    try:
+        return int(facts.get(key, ""))
+    except ValueError:
+        return 0
+
+
+def _judge_stall(facts: dict[str, Any]) -> tuple[str, str]:
+    """Turn the probe into (verdict, explanation for a non-programmer).
+
+    verdict is one of: working, slow-disk, stuck, broken.
+    """
+    if not facts["answered"]:
+        return "broken", ("The rented computer did not answer a basic health\n"
+                          "  check within two minutes.")
+    if facts.get("SETUP_ALIVE") == "no":
+        return "broken", ("The setup program on the rented computer stopped\n"
+                          "  without finishing.")
+    if facts.get("DISK_RC") == "124" or facts.get("SMALL_RC") == "124":
+        return "broken", ("The rented computer's disk is not responding: saving\n"
+                          "  test files took over a minute.")
+
+    net = _fact(facts, "NET_KBPS")
+    cpu = _fact(facts, "CPU_BUSY_PCT")
+    iowait = _fact(facts, "IOWAIT_PCT")
+    disk_seconds = _fact(facts, "DISK_MS") / 1000
+    small_seconds = _fact(facts, "SMALL_MS") / 1000
+    running = any(proc.startswith("R") for proc in facts["procs"])
+    # On RunPod, /workspace can be MooseFS mounted over FUSE. Measured Oct
+    # 2026: big writes there are fine (64 MB in 0.5 s) but small files are
+    # ~80x slower than local disk, and installing PyTorch writes tens of
+    # thousands of them. A process waiting on FUSE sleeps in
+    # request_wait_answer - 0% CPU, no iowait - so without these two checks
+    # a slow-but-alive install reads exactly like a dead one.
+    on_fuse = any("request_wait_answer" in p or "fuse" in p for p in facts["procs"])
+    waiting_on_disk = any(p.startswith("D") for p in facts["procs"])
+
+    if net >= 200:
+        return "working", f"Still downloading, at about {net / 1024:.1f} MB/s."
+    if small_seconds > 2 or disk_seconds > 15 or iowait >= 10 or on_fuse or waiting_on_disk:
+        return "slow-disk", ("Waiting on a slow disk. Saving 100 small test files took\n"
+                             f"  {small_seconds:.1f} s; a normal disk takes under 0.2 s.")
+    if running or cpu >= 2:
+        return "working", f"Still working: the processor is {cpu}% busy."
+    return "stuck", ("Nothing is happening on the rented computer: no downloading,\n"
+                     "  no processing, and its disk is fine. Setup is stuck.")
+
+
+def _check_quiet_pod(ssh: Ssh, quiet: float, log: SetupLog) -> tuple[str, str]:
+    minutes = int(quiet // 60)
+    sh.warn(f"{datetime.now():%H:%M}  No new output for {minutes} minutes. "
+            "Checking the rented computer...")
+    try:
+        facts = _probe_pod(ssh)
+    except Exception as exc:
+        facts = {"answered": False, "procs": [], "error": str(exc)}
+    verdict, explanation = _judge_stall(facts)
+
+    if facts["answered"]:
+        details = (f"cpu {_fact(facts, 'CPU_BUSY_PCT')}%, "
+                   f"disk wait {_fact(facts, 'IOWAIT_PCT')}%, "
+                   f"network {_fact(facts, 'NET_KBPS')} KB/s, "
+                   f"64 MB disk write {_fact(facts, 'DISK_MS') / 1000:.1f} s, "
+                   f"100 small files {_fact(facts, 'SMALL_MS') / 1000:.1f} s, "
+                   f"disk type {facts.get('FS_TYPE') or 'unknown'}")
+    else:
+        details = f"no answer ({facts.get('error', 'timed out')})"
+    for line in explanation.splitlines():
+        sh.step("     " + line.strip())
+    sh.step(f"     ({details})")
+
+    log.write(f"client: quiet for {minutes} min - verdict {verdict}: "
+              + " ".join(part.strip() for part in explanation.splitlines()))
+    log.write(f"client: {details}")
+    for proc in facts["procs"]:
+        log.write(f"client: process {proc}")
+    return verdict, explanation
+
+
+def _give_up(ssh: Ssh, log: SetupLog, reason: str) -> None:
+    """Abandon a stalled setup. run()'s finally then shuts the pod down."""
+    ssh.self_terminate_armed = False
+    log.write("client: giving up on this pod - "
+              + " ".join(part.strip() for part in reason.splitlines()))
+    raise UserFacingError(
+        "Setup on the rented computer stalled, so I stopped it.\n\n"
+        f"  {reason}\n\n"
+        "  This is a problem with that particular rented computer, not\n"
+        "  with your photos or settings. It is being shut down now so you\n"
+        "  stop being charged. Run \"1 - TRAIN IN THE CLOUD.bat\" again -\n"
+        "  you will most likely get a different computer.\n\n"
+        f"  A full log was saved to:\n    {SETUP_LOG_FILE}\n"
+        "  If this keeps happening, send that file to whoever gave you\n"
+        "  this trainer."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +1001,7 @@ def upload_everything(
 
 def remote_checkpoints(ssh: Ssh) -> list[str]:
     out, _, code = ssh.run(
-        f"find {REMOTE_OUTPUT} -name '*.safetensors' 2>/dev/null | sort"
+        f"find {REMOTE_OUTPUT} -name '*.safetensors' {NOT_PREVIEW_LORA} 2>/dev/null | sort"
     )
     if code != 0:
         return []
@@ -687,7 +1047,7 @@ class IncrementalCollector:
     def _find_command(self) -> str:
         images = " -o ".join(f"-name '{pattern}'" for pattern in self.IMAGE_NAMES)
         return (
-            rf"find {REMOTE_OUTPUT} {NO_HIDDEN_DIRS} \( -name '*.safetensors' "
+            rf"find {REMOTE_OUTPUT} {NO_HIDDEN_DIRS} \( \( -name '*.safetensors' {NOT_PREVIEW_LORA} \) "
             rf"-o \( -path '*samples*' \( {images} \) \) \) "
             rf"-printf '%s\t%p\n' 2>/dev/null | sort -k2"
         )
@@ -788,8 +1148,11 @@ def monitor(ssh: Ssh, steps: int, output_dir: Path) -> str:
     sh.say()
     sh.say("  Training is running on the rented computer.")
     sh.say("  You can leave this window open and go and do something else.")
-    sh.say("  Closing it will NOT stop the training, but it will stop the")
-    sh.say("  automatic shutdown, so please leave it running if you can.")
+    sh.say("  Please leave it open. If you close it, the training carries on")
+    sh.say("  and the rented computer still shuts itself down, but only after")
+    sh.say("  waiting up to 2 hours for your results to be collected - and you")
+    sh.say("  are charged for that wait. To collect them, run")
+    sh.say("  \"1 - TRAIN IN THE CLOUD.bat\" again before then.")
     sh.say()
     sh.say("  Snapshots and preview pictures are copied into the 'output'")
     sh.say("  folder as soon as each one is ready, so you can look at them")
@@ -826,7 +1189,7 @@ def monitor(ssh: Ssh, steps: int, output_dir: Path) -> str:
             if not downloading_announced and time.time() - started > 60:
                 downloading_announced = True
                 sh.say("  Setting up and downloading the AI model (about 35 GB).")
-                sh.say("  This part takes 30-45 minutes. Nothing is wrong.")
+                sh.say("  This usually takes 5-15 minutes. Nothing is wrong.")
             if "CAPTION:" in text and "CAPTION: wrote" not in text:
                 printer.maybe_print({"step": None}, force=False)
         else:
@@ -1275,6 +1638,10 @@ def run(args: argparse.Namespace) -> int:
         output_dir=REMOTE_OUTPUT,
         lora_path=f"{REMOTE_OUTPUT}/{run_name}/{run_name}.safetensors",
         tier=tier,
+        # One round of previews, not two. Measured Oct 2026: the default
+        # rendered every prompt twice, ~2.5 extra minutes of GPU for
+        # near-identical pictures.
+        sample_once=True,
     )
 
     key, public_key, private_pem = generate_keypair()
@@ -1294,8 +1661,8 @@ def run(args: argparse.Namespace) -> int:
                 gpu_ids=gpu_ids,
                 public_key=public_key,
                 env={
-                    # Keep the 35GB of model downloads on the big volume
-                    # rather than the small container disk.
+                    # Out of /root/.cache so every large file sits in one
+                    # place, beside the run it belongs to.
                     "HF_HOME": "/workspace/hf-cache",
                     "HF_TOKEN": settings.huggingface_token,
                 },
@@ -1361,7 +1728,7 @@ def run(args: argparse.Namespace) -> int:
 
         sh.header("Step 4 of 5 - training")
         sh.say("  Installing software and downloading the AI model.")
-        sh.say("  This part takes 30-45 minutes and prints a lot of text.")
+        sh.say("  This usually takes 10-20 minutes and prints a lot of text.")
         sh.say()
 
         # Every one of these is passed explicitly rather than relying on the
@@ -1382,7 +1749,7 @@ def run(args: argparse.Namespace) -> int:
         if args.setup_only:
             env_prefix += "SETUP_ONLY=1 "
 
-        code = ssh.run_streaming(f"{env_prefix}bash {REMOTE_SCRIPT}", timeout=5400)
+        code = run_setup(ssh, env_prefix, pod_id)
         if code != 0:
             # Setup failed, so the pod is not in a state where its own shutdown
             # can be trusted - the wrapper that runs the terminator may never
@@ -1392,7 +1759,8 @@ def run(args: argparse.Namespace) -> int:
             raise UserFacingError(
                 "Setting up the rented computer failed. The messages above\n"
                 "  explain why. Nothing further was started, and the computer\n"
-                "  is about to be shut down so you stop being charged."
+                "  is about to be shut down so you stop being charged.\n\n"
+                f"  A full log was saved to:\n    {SETUP_LOG_FILE}"
             )
 
         if args.setup_only:
@@ -1606,6 +1974,7 @@ def main() -> int:
                         choices=[""] + [g["name"] for g in GPU_GROUPS],
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
+    sh.disable_click_to_pause()
 
     try:
         if args.shutdown_all:

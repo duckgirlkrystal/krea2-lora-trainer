@@ -76,9 +76,8 @@ MAX_TRAIN_HOURS="${MAX_TRAIN_HOURS:-6}"
 GRACE_HOURS="${GRACE_HOURS:-2}"
 
 # The model download is ~35GB and HuggingFace keeps a second transient copy
-# while it verifies. The default cache lives under /root, which is on the
-# small container disk; /workspace is the big volume. Getting this wrong
-# fills the disk 30 minutes into the run.
+# while it verifies. The client sizes the container disk for that and gives
+# the pod no network volume, so /workspace is local disk like everything else.
 export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
 export HF_HUB_ENABLE_HF_TRANSFER=0
 
@@ -96,6 +95,19 @@ else
     print_warning "No pod id available. This pod cannot shut itself down;"
     print_warning "the client and the terminateAfter deadline still can."
 fi
+
+# Recorded up front because it decides how long setup takes. Setup writes
+# tens of thousands of small files, and on RunPod's FUSE network storage each
+# one is ~80x slower than on local disk (measured Oct 2026). The client no
+# longer requests a volume, so this should always say local; if it ever does
+# not, the log says why everything after it is slow.
+WORK_FS=$(findmnt -no FSTYPE --target "$WORK_DIR" 2>/dev/null)
+print_status "Storage for $WORK_DIR: ${WORK_FS:-unknown}"
+case "$WORK_FS" in
+    fuse*|nfs*|cifs|smb*)
+        print_warning "That is network storage. Installing will be much slower than usual."
+        ;;
+esac
 
 apt-get update -qq >/dev/null 2>&1 || true
 apt-get install -y -qq git python3-pip python3-venv curl >/dev/null 2>&1 || true
@@ -350,8 +362,8 @@ if [ $? -ne 0 ]; then
 fi
 
 DISK_FREE=$(df -BG /workspace 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
-print_status "Free disk on /workspace: ${DISK_FREE}GB (about 40GB needed)"
-if [ -n "$DISK_FREE" ] && [ "$DISK_FREE" -lt 40 ] 2>/dev/null; then
+print_status "Free disk on /workspace: ${DISK_FREE}GB (about 80GB needed at peak)"
+if [ -n "$DISK_FREE" ] && [ "$DISK_FREE" -lt 80 ] 2>/dev/null; then
     print_warning "Disk space is tight. The model download may fail."
 fi
 
@@ -551,7 +563,7 @@ if kill -0 "$TRAIN_PID" 2>/dev/null; then
     echo "  Log:    $TRAIN_LOG"
     echo "  Output: $OUTPUT_DIR"
     echo ""
-    print_status "The first 30-45 minutes are spent downloading the 35GB model."
+    print_status "The first 5-15 minutes are spent downloading the 35GB model."
     sleep 5
     head -20 "$TRAIN_LOG" 2>/dev/null || true
 else

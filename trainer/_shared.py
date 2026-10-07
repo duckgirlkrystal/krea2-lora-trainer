@@ -132,6 +132,34 @@ def bullets(lines: Iterable[str]) -> None:
         _emit("    - " + line)
 
 
+def disable_click_to_pause() -> None:
+    """Turn off QuickEdit for this console window (Windows only).
+
+    With QuickEdit on, one stray click inside the window starts a text
+    selection, and Windows freezes the program on its next print until the
+    selection ends. The title gains "Select" and nothing else hints at it,
+    so to the user the trainer simply looks hung - for hours, in practice.
+    The cost is that text can no longer be copied out with the mouse; the
+    run's log file covers that.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        std_input = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(std_input, ctypes.byref(mode)):
+            return
+        enable_quick_edit, enable_extended_flags = 0x0040, 0x0080
+        kernel32.SetConsoleMode(
+            std_input, (mode.value & ~enable_quick_edit) | enable_extended_flags
+        )
+    except Exception:
+        pass
+
+
 def ask(prompt: str, default: str = "") -> str:
     """Prompt for a line of input, tolerating a missing console."""
     suffix = f" [{default}]" if default else ""

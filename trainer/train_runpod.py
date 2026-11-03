@@ -177,6 +177,38 @@ GPU_GROUPS: list[dict[str, Any]] = [
     },
 ]
 
+# MOSS-Image (--model moss). A 5B DiT plus a 9B text encoder, both in bf16:
+# ~30GB of weights, so a 48GB card trains it unquantized. 80GB is only the
+# fallback when no 48GB card is free; the config is identical on both.
+# seconds_per_step values are from real MOSS runs (Nov 2026).
+MOSS_GPU_GROUPS: list[dict[str, Any]] = [
+    {
+        "name": "48GB",
+        "tier": "big",
+        "seconds_per_step": 2.4,  # measured 2.33 on an L40S, Nov 2026
+        "gpus": [
+            "NVIDIA L40S",
+            "NVIDIA RTX A6000",
+            "NVIDIA A40",
+            "NVIDIA L40",
+        ],
+        "fallback_price": 0.99,
+    },
+    {
+        "name": "80GB",
+        "tier": "big",
+        # Measured 3.4 on an A100 SXM, Nov 2026 - slower than the L40S.
+        "seconds_per_step": 3.4,
+        # A100s only. MOSS gains nothing from an H100 that is worth up to
+        # $3.99/hr against the A100's $1.79 (catalog, Nov 2026).
+        "gpus": [
+            "NVIDIA A100 80GB PCIe",
+            "NVIDIA A100-SXM4-80GB",
+        ],
+        "fallback_price": 1.79,
+    },
+]
+
 SETUP_HOURS = 1.0          # env install plus the ~35GB model download
 MIN_TERMINATE_HOURS = 4.0  # never set the billing deadline tighter than this
 
@@ -882,7 +914,9 @@ def _give_up(ssh: Ssh, log: SetupLog, reason: str) -> None:
 # Cost and planning
 # ---------------------------------------------------------------------------
 
-def choose_gpu_group(runpod: RunPod, only: str = "") -> tuple[dict, list[str], float]:
+def choose_gpu_group(
+    runpod: RunPod, only: str = "", model: str = _configs.DEFAULT_MODEL
+) -> tuple[dict, list[str], float]:
     """Pick a GPU group, preferring the reference 80GB configuration.
 
     Availability from the catalog is a hint, not a reservation, so the
@@ -897,7 +931,8 @@ def choose_gpu_group(runpod: RunPod, only: str = "") -> tuple[dict, list[str], f
     if not catalog:
         sh.step("Could not read the GPU price list; using standard settings.")
 
-    groups = [g for g in GPU_GROUPS if not only or g["name"] == only]
+    candidates = MOSS_GPU_GROUPS if model == "moss" else GPU_GROUPS
+    groups = [g for g in candidates if not only or g["name"] == only]
     for group in groups:
         available = []
         prices = []
@@ -1566,12 +1601,32 @@ def run(args: argparse.Namespace) -> int:
         runpod_api_key=MY_RUNPOD_API_KEY,
     )
     steps = args.steps or settings.training_steps or 2000
+
+    # --model skips the question (scripted runs); otherwise ask every time,
+    # with the last choice as the Enter default, and remember the answer.
+    last_model = settings.extras.get("model", _configs.DEFAULT_MODEL)
+    if args.model:
+        model_key = args.model
+    elif args.yes:
+        model_key = last_model if last_model in _configs.MODELS else _configs.DEFAULT_MODEL
+    else:
+        sh.say()
+        model_key = sh.choose_model(_configs.MODELS, last_model)
+    model = _configs.MODELS[model_key]
+    if settings.extras.get("model") != model_key:
+        settings.extras["model"] = model_key
+        settings.save()
+    sh.ok(f"Training for: {model.label}")
+
     slug = sh.make_slug(settings.character_name)
-    run_name = f"{slug}_krea2"
+    run_name = f"{slug}_{model.run_suffix}"
+    photos_dir = Path(args.photos).expanduser() if getattr(args, "photos", "") else sh.PHOTOS_DIR
 
     sh.header("Step 1 of 5 - your photos")
-    sh.prepare_photos(sh.PHOTOS_DIR, sh.DATASET_DIR)
-    # Deliberately NO caption writing here. Verified live on 2026-08-04: the
+    sh.prepare_photos(photos_dir, sh.DATASET_DIR)
+    # Captions the user supplied beside the photos are carried over inside
+    # prepare_photos (all or nothing); nothing else is written here.
+    # Deliberately NO fallback caption writing here. Verified live on 2026-08-04: the
     # pod skips captioning when it already sees one .txt per image, so writing
     # fallback captions before upload silently disabled the Qwen3-VL captioner
     # on every cloud run, training on "<trigger>, a photograph of <trigger>".
@@ -1592,7 +1647,9 @@ def run(args: argparse.Namespace) -> int:
         return resume(args)
 
     sh.header("Step 2 of 5 - renting a computer")
-    group, gpu_ids, price = choose_gpu_group(runpod, getattr(args, "gpu_group", ""))
+    group, gpu_ids, price = choose_gpu_group(
+        runpod, getattr(args, "gpu_group", ""), model.key
+    )
     hours = estimate_hours(group, steps)
     cost = hours * price
     tier = _configs.TIER_BY_KEY[group["tier"]]
@@ -1630,6 +1687,7 @@ def run(args: argparse.Namespace) -> int:
         steps=steps,
         tier=tier,
         sample_during_training=False,
+        model=model.key,
     )
     preview_config_text = _configs.build_preview_config(
         run_name=run_name,
@@ -1638,6 +1696,7 @@ def run(args: argparse.Namespace) -> int:
         output_dir=REMOTE_OUTPUT,
         lora_path=f"{REMOTE_OUTPUT}/{run_name}/{run_name}.safetensors",
         tier=tier,
+        model=model.key,
         # One round of previews, not two. Measured Oct 2026: the default
         # rendered every prompt twice, ~2.5 extra minutes of GPU for
         # near-identical pictures.
@@ -1745,6 +1804,10 @@ def run(args: argparse.Namespace) -> int:
             f'SELF_TERMINATE=1 '
             f'MAX_TRAIN_HOURS={max(6, int(hours * 3) + 1)} '
             f'GRACE_HOURS=2 '
+            f'BASE_MODEL_REPO="{model.base_model}" '
+            f'MODEL_ARCH="{model.arch}" '
+            f'EXPECTED_VRAM_GB={model.expected_vram_gb} '
+            f'AI_TOOLKIT_REF="{model.ai_toolkit_ref}" '
         )
         if args.setup_only:
             env_prefix += "SETUP_ONLY=1 "
@@ -1970,6 +2033,9 @@ def main() -> int:
     parser.add_argument("--yes", action="store_true", help="Skip the cost confirmation")
     parser.add_argument("--resume", action="store_true",
                         help="Reconnect to an interrupted run and collect its results")
+    parser.add_argument("--model", default="", choices=[""] + sorted(_configs.MODELS),
+                        help="Base model to train for; skips the model question")
+    parser.add_argument("--photos", default="", help=argparse.SUPPRESS)
     parser.add_argument("--gpu-group", default="",
                         choices=[""] + [g["name"] for g in GPU_GROUPS],
                         help=argparse.SUPPRESS)

@@ -178,6 +178,29 @@ def ask_secret(prompt: str) -> str:
     return ask(prompt)
 
 
+def choose_model(models: dict, current: str) -> str:
+    """Ask which base model to train. Enter keeps `current` (the last choice).
+
+    `models` maps key -> an object with `label` and `description`. Returns a key.
+    """
+    keys = list(models)
+    if current not in models:
+        current = keys[0]
+    say("  Which AI model should your character be trained for?")
+    say()
+    for number, key in enumerate(keys, start=1):
+        marker = "   (last used)" if key == current else ""
+        say(f"    {number}. {models[key].label}{marker}")
+        say(f"       {models[key].description}")
+    say()
+    default_number = str(keys.index(current) + 1)
+    while True:
+        answer = ask("Type a number", default=default_number).strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(keys):
+            return keys[int(answer) - 1]
+        problem(f"Please type a number from 1 to {len(keys)}.")
+
+
 def confirm(prompt: str, expect: str = "YES") -> bool:
     answer = ask(f"{prompt} (type {expect} to continue)")
     return answer.strip().upper() == expect.upper()
@@ -657,6 +680,9 @@ def prepare_photos(source_dir: Path, dataset_dir: Path) -> int:
     kept = 0
     skipped: list[str] = []
     small: list[str] = []
+    # Captions supplied beside the photos (<photo>.txt), keyed by the
+    # dataset name each photo is saved under.
+    supplied: dict[str, str] = {}
 
     for source in photos:
         try:
@@ -684,6 +710,11 @@ def prepare_photos(source_dir: Path, dataset_dir: Path) -> int:
 
                 kept += 1
                 img.save(dataset_dir / f"photo_{kept:03d}.jpg", "JPEG", quality=95)
+                caption = source.with_suffix(".txt")
+                if caption.is_file():
+                    text = caption.read_text(encoding="utf-8").strip()
+                    if text:
+                        supplied[f"photo_{kept:03d}"] = text
         except Exception as exc:
             reason = "not a readable image"
             if source.suffix.lower() in (".heic", ".heif"):
@@ -708,6 +739,19 @@ def prepare_photos(source_dir: Path, dataset_dir: Path) -> int:
             f"  for a decent result ({RECOMMENDED_PHOTOS}-40 is ideal).\n\n"
             f"  Add more photos to:\n    {source_dir}\n\n"
             "  Then run this again."
+        )
+
+    # All or nothing. The pod skips its automatic captioner when it finds one
+    # caption per photo, and runs it over everything otherwise - so a partial
+    # set would either be overwritten or leave photos with no description.
+    if supplied and len(supplied) == kept:
+        for stem, text in supplied.items():
+            (dataset_dir / f"{stem}.txt").write_text(text, encoding="utf-8")
+        ok(f"Using your own captions for all {kept} photos.")
+    elif supplied:
+        warn(
+            f"Only {len(supplied)} of {kept} photos have a caption file, so all "
+            "of them will be described automatically instead."
         )
 
     ok(f"{kept} photos ready.")

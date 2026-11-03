@@ -56,6 +56,10 @@ There are two ways. Pick one.
   You need a RunPod account with some money on it. The program
   tells you exactly how to get one.
 
+  It asks which AI model to train for: Krea 2 or MOSS-Image.
+  Pick the one you will be making pictures with. If you are not
+  sure, press Enter to keep the one it suggests.
+
 
   OPTION B - USE YOUR OWN GRAPHICS CARD  (free, but picky)
   ---------------------------------------------------------

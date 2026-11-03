@@ -10,7 +10,11 @@ No command line. No Python knowledge. No config files to edit. You put photos
 in a folder and double-click a file.
 
 Built on [Krea 2](https://huggingface.co/krea/krea-2) via
-[ai-toolkit](https://github.com/ostris/ai-toolkit).
+[ai-toolkit](https://github.com/ostris/ai-toolkit). Cloud runs can instead train for
+[MOSS-Image Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base): the trainer
+asks which model at the start of every cloud run, remembering your last choice
+(`train_runpod.py --model krea2|moss` skips the question). Training on your own PC is
+Krea 2 only for now.
 
 ---
 
@@ -110,4 +114,5 @@ that, but the `.gitignore` is the first line of defence.
 MIT. See [LICENSE](LICENSE).
 
 Krea 2 itself is under its own licence, which you accept on HuggingFace before
-you can download it. This tool does not redistribute model weights.
+you can download it. MOSS-Image is Apache 2.0 and needs no licence step. This tool
+does not redistribute model weights.

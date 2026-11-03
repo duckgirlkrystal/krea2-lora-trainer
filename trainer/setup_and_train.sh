@@ -22,6 +22,10 @@ set -uo pipefail
 #   MAX_TRAIN_HOURS   Hard cap on training time (default 6)
 #   GRACE_HOURS       How long to wait after training for the client to
 #                     collect results before shutting down anyway (default 2)
+#   BASE_MODEL_REPO   HuggingFace repo of the base model (default Krea 2 Raw)
+#   MODEL_ARCH        ai-toolkit arch the config must declare (default krea2)
+#   EXPECTED_VRAM_GB  Warn below this much VRAM (default 40)
+#   AI_TOOLKIT_REF    ai-toolkit commit to check out; empty means main
 #
 # Training runs under nohup so the SSH session can drop without killing it.
 # Never buffer hours of output over SSH.
@@ -74,6 +78,10 @@ SETUP_ONLY="${SETUP_ONLY:-0}"
 SELF_TERMINATE="${SELF_TERMINATE:-1}"
 MAX_TRAIN_HOURS="${MAX_TRAIN_HOURS:-6}"
 GRACE_HOURS="${GRACE_HOURS:-2}"
+BASE_MODEL_REPO="${BASE_MODEL_REPO:-krea/Krea-2-Raw}"
+MODEL_ARCH="${MODEL_ARCH:-krea2}"
+EXPECTED_VRAM_GB="${EXPECTED_VRAM_GB:-40}"
+AI_TOOLKIT_REF="${AI_TOOLKIT_REF:-}"
 
 # The model download is ~35GB and HuggingFace keeps a second transient copy
 # while it verifies. The client sizes the container disk for that and gives
@@ -125,6 +133,25 @@ apt-get install -y -qq git python3-pip python3-venv curl >/dev/null 2>&1 || true
 # without the repo it belongs to.
 CLONE_MARKER="$REPO_DIR/.download_complete"
 
+# A pinned model (AI_TOOLKIT_REF) is checked out by exact commit. GitHub
+# serves a commit by id to a shallow fetch, so this stays a small download.
+# The rev-parse comparison is the proof: a fetch that quietly fell back to
+# main would fail it rather than train on unverified code.
+checkout_pinned_ref() {
+    if [ -z "$AI_TOOLKIT_REF" ]; then
+        return 0
+    fi
+    git -C "$REPO_DIR" fetch --depth 1 origin "$AI_TOOLKIT_REF" \
+        && git -C "$REPO_DIR" checkout -q FETCH_HEAD \
+        && [ "$(git -C "$REPO_DIR" rev-parse HEAD)" = "$AI_TOOLKIT_REF" ]
+}
+
+if [ -f "$CLONE_MARKER" ] && [ -n "$AI_TOOLKIT_REF" ] \
+        && [ "$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" != "$AI_TOOLKIT_REF" ]; then
+    print_warning "The training software here is a different version. Downloading again."
+    rm -f "$CLONE_MARKER"
+fi
+
 if [ -f "$CLONE_MARKER" ]; then
     print_status "Training software already present"
 else
@@ -137,7 +164,8 @@ else
         rm -rf "$REPO_DIR"
         if git clone --depth 1 https://github.com/ostris/ai-toolkit.git "$REPO_DIR" \
             && git -C "$REPO_DIR" rev-parse --verify HEAD >/dev/null 2>&1 \
-            && [ -f "$REPO_DIR/run.py" ]; then
+            && [ -f "$REPO_DIR/run.py" ] \
+            && checkout_pinned_ref; then
             touch "$CLONE_MARKER"
             break
         fi
@@ -153,6 +181,7 @@ else
     fi
     print_success "Downloaded"
 fi
+print_status "ai-toolkit version: $(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 cd "$REPO_DIR" || exit 1
 
@@ -216,19 +245,26 @@ if [ -z "$HF_TOKEN" ]; then
 fi
 export HF_TOKEN
 
-.venv/bin/python3 - <<'PYEOF'
+.venv/bin/python3 - "$BASE_MODEL_REPO" "$MODEL_ARCH" <<'PYEOF'
 import os, sys
 from huggingface_hub import HfApi
 
 token = os.environ["HF_TOKEN"]
-try:
-    info = HfApi(token=token).model_info("krea/Krea-2-Raw", files_metadata=False)
-    print(f"Access OK: krea/Krea-2-Raw (gated={info.gated})")
-except Exception as exc:
-    print(f"CANNOT ACCESS krea/Krea-2-Raw: {exc}")
-    print("The HuggingFace account for this token has not accepted the Krea 2")
-    print("licence. Open https://huggingface.co/krea/Krea-2-Raw and accept it.")
-    sys.exit(1)
+repo, arch = sys.argv[1], sys.argv[2]
+repos = [repo]
+if arch == "moss_image":
+    # ai-toolkit fetches MOSS's weights from the ComfyUI repacks, not from
+    # the vendor repo, so those are the downloads that have to work.
+    repos += ["Comfy-Org/MOSS-Image", "Comfy-Org/Qwen3.5"]
+for name in repos:
+    try:
+        info = HfApi(token=token).model_info(name, files_metadata=False)
+        print(f"Access OK: {name} (gated={info.gated})")
+    except Exception as exc:
+        print(f"CANNOT ACCESS {name}: {exc}")
+        print("The HuggingFace account for this token may not have accepted the")
+        print(f"model licence. Open https://huggingface.co/{name} and accept it.")
+        sys.exit(1)
 PYEOF
 if [ $? -ne 0 ]; then
     exit 1
@@ -310,18 +346,18 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
-.venv/bin/python3 - "$CONFIG_FILE" "$RUN_NAME" <<'PYEOF'
+.venv/bin/python3 - "$CONFIG_FILE" "$RUN_NAME" "$MODEL_ARCH" "$BASE_MODEL_REPO" <<'PYEOF'
 import sys, yaml
 
 with open(sys.argv[1]) as handle:
     cfg = yaml.safe_load(handle)
 
-expected_name = sys.argv[2]
+expected_name, expected_arch, expected_repo = sys.argv[2], sys.argv[3], sys.argv[4]
 proc = cfg["config"]["process"][0]
 model, train, net = proc["model"], proc["train"], proc["network"]
 
-assert model["arch"] == "krea2", f"arch must be krea2, got {model['arch']}"
-assert model["name_or_path"] == "krea/Krea-2-Raw", model["name_or_path"]
+assert model["arch"] == expected_arch, f"arch must be {expected_arch}, got {model['arch']}"
+assert model["name_or_path"] == expected_repo, model["name_or_path"]
 assert cfg["config"]["name"] == expected_name, (
     f"config name {cfg['config']['name']!r} != expected {expected_name!r}"
 )
@@ -345,17 +381,18 @@ if [ $? -ne 0 ]; then
 fi
 print_success "Config validated"
 
-.venv/bin/python3 - <<'PYEOF'
+.venv/bin/python3 - "$EXPECTED_VRAM_GB" <<'PYEOF'
 import sys, torch
 
+expected = int(sys.argv[1])
 if not torch.cuda.is_available():
     print("CUDA: NOT AVAILABLE - training cannot run")
     sys.exit(1)
 name = torch.cuda.get_device_name(0)
 vram = torch.cuda.get_device_properties(0).total_memory // 1024**3
 print(f"GPU: {name}, {vram}GB VRAM")
-if vram < 40:
-    print(f"WARNING: {vram}GB is below what this config expects")
+if vram < expected:
+    print(f"WARNING: {vram}GB is below the {expected}GB this config expects")
 PYEOF
 if [ $? -ne 0 ]; then
     exit 1
@@ -365,6 +402,30 @@ DISK_FREE=$(df -BG /workspace 2>/dev/null | tail -1 | awk '{print $4}' | tr -d '
 print_status "Free disk on /workspace: ${DISK_FREE}GB (about 80GB needed at peak)"
 if [ -n "$DISK_FREE" ] && [ "$DISK_FREE" -lt 80 ] 2>/dev/null; then
     print_warning "Disk space is tight. The model download may fail."
+fi
+
+# MOSS support is new in ai-toolkit and pulls in transformers' Qwen3.5
+# classes. Import the model class here, in seconds, rather than discover a
+# missing dependency after the 30GB download inside the training run.
+if [ "$MODEL_ARCH" = "moss_image" ]; then
+    print_status "Checking the MOSS-Image code loads..."
+    if ! .venv/bin/python3 - <<'PYEOF'
+import sys
+sys.path.insert(0, ".")
+from transformers import Qwen3_5Model, Qwen3_5TextModel  # noqa: F401
+from extensions_built_in.diffusion_models import MossImageModel
+from toolkit.util.get_model import get_model_class
+from toolkit.config_modules import ModelConfig
+
+cls = get_model_class(ModelConfig(name_or_path="OpenMOSS-Team/MOSS-Image-Base", arch="moss_image"))
+assert cls is MossImageModel, f"arch moss_image resolved to {cls}"
+print(f"MOSS-Image code OK ({cls.__name__})")
+PYEOF
+    then
+        print_error "The MOSS-Image code could not be loaded."
+        exit 1
+    fi
+    print_success "MOSS-Image code loads"
 fi
 
 if [ "$SETUP_ONLY" = "1" ]; then
